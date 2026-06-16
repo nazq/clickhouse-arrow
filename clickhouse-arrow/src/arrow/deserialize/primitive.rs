@@ -124,7 +124,6 @@ macro_rules! primitive_async {
         }
     }};
 }
-pub(super) use primitive_async;
 
 /// Deserializes a `ClickHouse` primitive type into an Arrow array.
 ///

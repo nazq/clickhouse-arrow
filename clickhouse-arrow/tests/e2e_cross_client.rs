@@ -29,3 +29,14 @@ e2e_test!(
     TRACING_DIRECTIVES,
     None
 );
+
+// Enum dictionary encoding: SQL->Arrow asserts the dictionary key space is
+// the enum declaration order; Arrow->SQL inserts a reordered dictionary to
+// prove the writer resolves by string, not by assuming key == enum index.
+#[cfg(feature = "test-utils")]
+e2e_test!(
+    e2e_cross_client_enum_dictionary,
+    tests::cross_client::test_enum_dictionary,
+    TRACING_DIRECTIVES,
+    None
+);

@@ -12,9 +12,10 @@
 /// separate bitmap in `null.rs` for `Nullable(Enum)` types.
 ///
 /// The implementation supports four input array types:
-/// - `DictionaryArray`: Validates that dictionary values match `pairs` exactly (order and
-///   content) and maps keys to the corresponding indices from `pairs` (e.g., key `0` to `1`
-///   for `("a", 1)`).
+/// - `DictionaryArray`: Resolves each row through its dictionary *string* into the
+///   `ClickHouse` enum index. The dictionary need not match `pairs` in order, length, or
+///   coverage — reordered, subset, and extra-slot dictionaries all serialize correctly. Only a
+///   dictionary value that is not a declared enum name is an error.
 /// - `PrimitiveArray`: Validates that values exist in `pairs` and writes the indices directly.
 /// - `StringArray`: Maps strings to indices.
 /// - `StringViewArray`: Maps strings to indices.
@@ -75,8 +76,8 @@ use crate::{Error, Result, Type};
 ///   - The `type_hint` is not `Enum8` or `Enum16`.
 ///   - The input array type is unsupported (not `DictionaryArray`, `PrimitiveArray`, or
 ///     `StringArray`).
-///   - Dictionary values or input values do not match `pairs`.
-///   - Dictionary keys are out of bounds.
+///   - A dictionary value, primitive value, or string is not a declared enum name/index.
+///   - Dictionary keys are out of bounds for the dictionary's own value array.
 /// - Returns `Io` if writing to the writer fails.
 pub(super) async fn serialize_async<W: ClickHouseWrite>(
     type_hint: &Type,
@@ -143,16 +144,16 @@ macro_rules! write_enum_values {
         /// # Errors
         /// - Returns `ArrowSerialize` if:
         ///   - The input array type is unsupported.
-        ///   - Dictionary values do not match `enum_values` exactly (order and content).
-        ///   - Primitive or string values are not found in `enum_values`.
-        ///   - Dictionary keys are out of bounds.
+        ///   - A dictionary value, primitive value, or string is not a declared enum name/index.
+        ///   - Dictionary keys are out of bounds for the dictionary's own value array.
         /// - Returns `Io` if writing to the writer fails.
         ///
         /// # Performance
         /// Optimized for small `enum_values` (typically <100 elements):
-        /// - Uses linear search for `PrimitiveArray` validation, cache-friendly.
-        /// - Builds a small `HashMap` for `StringArray` lookups, O(m) allocation where m is `enum_values.len()`.
-        /// - Writes sequentially to the writer, minimizing allocations and memory fragmentation.
+        /// - For `DictionaryArray`: builds a name→index map once, then resolves each dictionary
+        ///   slot to its enum index once (dict-sized, not row-sized); per-row writes are O(1).
+        /// - For `PrimitiveArray`: linear search over `enum_values`, cache-friendly.
+        /// - For `StringArray`: a small `HashMap` lookup, O(m) allocation where m is `enum_values.len()`.
         #[allow(unused_comparisons)]
         #[allow(clippy::too_many_lines)]
         #[allow(clippy::cast_lossless)]
@@ -166,6 +167,12 @@ macro_rules! write_enum_values {
             enum_values: &[(String, $pt)], // From Type::Enum8 or Enum16
         ) -> Result<()> {
             // DictionaryArray case
+            //
+            // Resolve each row through its dictionary *string* into the enum's
+            // CH index, rather than assuming the Arrow key space equals the
+            // enum index space. This accepts any valid dictionary — reordered,
+            // a subset of the enum, or with unused extra slots — not just one
+            // whose value table is positionally identical to `pairs`.
             $(
                 if let Some(array) = column.as_any().downcast_ref::<DictionaryArray<$kt>>() {
                     let keys = array.keys();
@@ -173,34 +180,37 @@ macro_rules! write_enum_values {
                         Error::ArrowSerialize("Enum values must be strings".into())
                     })?;
 
-                    // Validate dictionary matches enum_values
-                    if values.len() != enum_values.len() {
-                        return Err(Error::ArrowSerialize(format!(
-                            "Enum value count mismatch: {} vs {}",
-                            values.len(), enum_values.len()
-                        )));
-                    }
-                    for i in 0..values.len() {
-                        let dict_val = values.value(i);
-                        let enum_val = &enum_values[i].0;
-                        if dict_val != enum_val {
-                            return Err(Error::ArrowSerialize(format!(
-                                "Enum value mismatch at index {i}: '{dict_val}' vs '{enum_val}'"
-                            )));
-                        }
-                    }
-                    // Write enum values mapped from keys
+                    // string -> CH enum index, built once.
+                    let name_to_index: std::collections::HashMap<&str, $pt> = enum_values
+                        .iter()
+                        .map(|(s, v)| (s.as_str(), *v))
+                        .collect();
+
+                    // Arrow dictionary key -> CH enum index, resolved through the
+                    // dictionary's string values, built once over the dictionary
+                    // (size = dict, not rows).
+                    let key_to_index: Vec<$pt> = (0..values.len())
+                        .map(|d| {
+                            let name = values.value(d);
+                            name_to_index.get(name).copied().ok_or_else(|| {
+                                Error::ArrowSerialize(format!(
+                                    "Enum dictionary value '{name}' not in enum"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<$pt>>>()?;
+
                     for i in 0..keys.len() {
                         let value = if keys.is_null(i) {
-                            0 // Null as 0
+                            0 // Null as 0 (Nullable handled by null.rs)
                         } else {
                             let key = keys.value(i);
-                            if key < 0 || key as usize >= enum_values.len() {
+                            if key < 0 || key as usize >= key_to_index.len() {
                                 return Err(Error::ArrowSerialize(
                                     format!("Dictionary key {key} out of bounds")
                                 ));
                             }
-                            enum_values[key as usize].1 // Map key to enum value
+                            key_to_index[key as usize]
                         };
                         writer.$write_fn(value).await?;
                     }
@@ -339,6 +349,11 @@ macro_rules! put_enum_values {
             enum_values: &[(String, $pt)], // From Type::Enum8 or Enum16
         ) -> Result<()> {
             // DictionaryArray case
+            //
+            // Resolve each row through its dictionary *string* into the enum's
+            // CH index, rather than assuming the Arrow key space equals the
+            // enum index space. This accepts any valid dictionary — reordered,
+            // a subset of the enum, or with unused extra slots.
             $(
                 if let Some(array) = column.as_any().downcast_ref::<DictionaryArray<$kt>>() {
                     let keys = array.keys();
@@ -346,34 +361,33 @@ macro_rules! put_enum_values {
                         Error::ArrowSerialize("Enum values must be strings".into())
                     })?;
 
-                    // Validate dictionary matches enum_values
-                    if values.len() != enum_values.len() {
-                        return Err(Error::ArrowSerialize(format!(
-                            "Enum value count mismatch: {} vs {}",
-                            values.len(), enum_values.len()
-                        )));
-                    }
-                    for i in 0..values.len() {
-                        let dict_val = values.value(i);
-                        let enum_val = &enum_values[i].0;
-                        if dict_val != enum_val {
-                            return Err(Error::ArrowSerialize(format!(
-                                "Enum value mismatch at index {i}: '{dict_val}' vs '{enum_val}'"
-                            )));
-                        }
-                    }
-                    // Write enum values mapped from keys
+                    let name_to_index: std::collections::HashMap<&str, $pt> = enum_values
+                        .iter()
+                        .map(|(s, v)| (s.as_str(), *v))
+                        .collect();
+
+                    let key_to_index: Vec<$pt> = (0..values.len())
+                        .map(|d| {
+                            let name = values.value(d);
+                            name_to_index.get(name).copied().ok_or_else(|| {
+                                Error::ArrowSerialize(format!(
+                                    "Enum dictionary value '{name}' not in enum"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<$pt>>>()?;
+
                     for i in 0..keys.len() {
                         let value = if keys.is_null(i) {
-                            0 // Null as 0
+                            0 // Null as 0 (Nullable handled by null.rs)
                         } else {
                             let key = keys.value(i);
-                            if key < 0 || key as usize >= enum_values.len() {
+                            if key < 0 || key as usize >= key_to_index.len() {
                                 return Err(Error::ArrowSerialize(
                                     format!("Dictionary key {key} out of bounds")
                                 ));
                             }
-                            enum_values[key as usize].1 // Map key to enum value
+                            key_to_index[key as usize]
                         };
                         writer.$write_fn(value);
                     }
@@ -635,7 +649,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_serialize_enum8_dictionary_invalid_value_length() {
+    async fn test_serialize_enum8_dictionary_value_not_in_enum() {
+        // A dictionary slot holds "c", which is not a declared enum name. Even
+        // though it's only referenced indirectly, the dictionary is resolved
+        // up front, so this is a hard error. (Previously this was a "length
+        // mismatch" check; the length check is gone — the rejection now comes
+        // from the unknown value.)
         let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8)];
         let keys = Int8Array::from(vec![0, 1, 0]);
         let values = StringArray::from(vec!["a", "b", "c"]);
@@ -643,7 +662,27 @@ mod tests {
             as ArrayRef;
         let mut writer = MockWriter::new();
         let result = serialize_async(&Type::Enum8(pairs), &mut writer, &array).await;
-        assert!(matches!(result, Err(Error::ArrowSerialize(_))));
+        assert!(matches!(
+            result,
+            Err(Error::ArrowSerialize(msg)) if msg.contains("not in enum")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_serialize_enum8_dictionary_superset_all_valid() {
+        // A dictionary that is a *superset* of the rows' values, where every
+        // slot is a valid enum name (here the enum has 3 names and the dict
+        // lists all 3, but the rows only reference two). This must serialize —
+        // there is no length-equality requirement.
+        let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8), ("c".to_string(), 3_i8)];
+        // dict ["a","b","c"]; rows reference only a (->1) and c (->3).
+        let keys = Int8Array::from(vec![0, 2, 0]);
+        let values = StringArray::from(vec!["a", "b", "c"]);
+        let array = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+            as ArrayRef;
+        let mut writer = MockWriter::new();
+        serialize_async(&Type::Enum8(pairs), &mut writer, &array).await.unwrap();
+        assert_eq!(writer, vec![1, 3, 1]);
     }
 
     #[tokio::test]
@@ -674,18 +713,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_serialize_enum8_dictionary_wrong_order() {
+    async fn test_serialize_enum8_dictionary_reordered() {
+        // Dictionary values in a different order than `pairs`. Rows are
+        // ["b", "a", "b"]; resolving through the dictionary string gives CH
+        // indices [2, 1, 2]. The serializer must accept this, not reject it.
         let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8)];
         let keys = Int8Array::from(vec![0, 1, 0]);
-        let values = StringArray::from(vec!["b", "a"]); // Wrong order
+        let values = StringArray::from(vec!["b", "a"]); // reordered vs pairs
+        let array = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+            as ArrayRef;
+        let mut writer = MockWriter::new();
+        serialize_async(&Type::Enum8(pairs), &mut writer, &array).await.unwrap();
+        assert_eq!(writer, vec![2, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_serialize_enum8_dictionary_subset() {
+        // Dictionary holds only one of the enum's values. Rows are all "b" =>
+        // CH index 2. A subset dictionary is valid and must serialize.
+        let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8)];
+        let keys = Int8Array::from(vec![0, 0, 0]);
+        let values = StringArray::from(vec!["b"]); // subset of the enum
+        let array = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+            as ArrayRef;
+        let mut writer = MockWriter::new();
+        serialize_async(&Type::Enum8(pairs), &mut writer, &array).await.unwrap();
+        assert_eq!(writer, vec![2, 2, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_serialize_enum8_dictionary_unknown_value_errors() {
+        // A dictionary value that isn't in the enum is still a hard error.
+        let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8)];
+        let keys = Int8Array::from(vec![0, 1]);
+        let values = StringArray::from(vec!["a", "zzz"]); // "zzz" not in enum
         let array = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
             as ArrayRef;
         let mut writer = MockWriter::new();
         let result = serialize_async(&Type::Enum8(pairs), &mut writer, &array).await;
         assert!(matches!(
             result,
-            Err(Error::ArrowSerialize(msg))
-            if msg.contains("Enum value mismatch")
+            Err(Error::ArrowSerialize(msg)) if msg.contains("not in enum")
         ));
     }
 
@@ -827,7 +895,8 @@ mod tests_sync {
     }
 
     #[test]
-    fn test_serialize_enum8_dictionary_invalid_value_length() {
+    fn test_serialize_enum8_dictionary_value_not_in_enum() {
+        // See the async twin: "c" is not a declared enum name -> hard error.
         let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8)];
         let keys = Int8Array::from(vec![0, 1, 0]);
         let values = StringArray::from(vec!["a", "b", "c"]);
@@ -835,7 +904,24 @@ mod tests_sync {
             as ArrayRef;
         let mut writer = MockWriter::new();
         let result = serialize(&Type::Enum8(pairs), &mut writer, &array);
-        assert!(matches!(result, Err(Error::ArrowSerialize(_))));
+        assert!(matches!(
+            result,
+            Err(Error::ArrowSerialize(msg)) if msg.contains("not in enum")
+        ));
+    }
+
+    #[test]
+    fn test_serialize_enum8_dictionary_superset_all_valid() {
+        // Superset dictionary, all slots valid enum names; rows reference a
+        // subset. Must serialize (no length-equality requirement).
+        let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8), ("c".to_string(), 3_i8)];
+        let keys = Int8Array::from(vec![0, 2, 0]);
+        let values = StringArray::from(vec!["a", "b", "c"]);
+        let array = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+            as ArrayRef;
+        let mut writer = MockWriter::new();
+        serialize(&Type::Enum8(pairs), &mut writer, &array).unwrap();
+        assert_eq!(writer, vec![1, 3, 1]);
     }
 
     #[test]
@@ -866,18 +952,30 @@ mod tests_sync {
     }
 
     #[test]
-    fn test_serialize_enum8_dictionary_wrong_order() {
+    fn test_serialize_enum8_dictionary_reordered() {
+        // See the async twin: ["b","a","b"] -> CH indices [2,1,2].
         let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8)];
         let keys = Int8Array::from(vec![0, 1, 0]);
-        let values = StringArray::from(vec!["b", "a"]); // Wrong order
+        let values = StringArray::from(vec!["b", "a"]); // reordered vs pairs
+        let array = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+            as ArrayRef;
+        let mut writer = MockWriter::new();
+        serialize(&Type::Enum8(pairs), &mut writer, &array).unwrap();
+        assert_eq!(writer, vec![2, 1, 2]);
+    }
+
+    #[test]
+    fn test_serialize_enum8_dictionary_unknown_value_errors() {
+        let pairs = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8)];
+        let keys = Int8Array::from(vec![0, 1]);
+        let values = StringArray::from(vec!["a", "zzz"]); // "zzz" not in enum
         let array = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
             as ArrayRef;
         let mut writer = MockWriter::new();
         let result = serialize(&Type::Enum8(pairs), &mut writer, &array);
         assert!(matches!(
             result,
-            Err(Error::ArrowSerialize(msg))
-            if msg.contains("Enum value mismatch")
+            Err(Error::ArrowSerialize(msg)) if msg.contains("not in enum")
         ));
     }
 

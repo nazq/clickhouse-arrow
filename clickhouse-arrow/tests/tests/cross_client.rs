@@ -800,3 +800,141 @@ pub async fn test_sparse_default_fill_non_nullable(ch: Arc<ClickHouseContainer>)
 
     client.shutdown().await.expect("shutdown");
 }
+
+// ===========================================================================
+// Enum dictionary encoding.
+//
+// Enum8/16 map to Arrow Dictionary. This exercises both directions against a
+// real server so a reader/writer bug can't round-trip-cancel:
+//
+//   Direction A: SQL INSERT of enum-name literals -> client.query (RecordBatch)
+//     -> assert the returned DictionaryArray's keys are the *position in the
+//     enum declaration* (schema-defined key space) and the values resolve to
+//     the right names.
+//   Direction B: insert a DictionaryArray whose value table is *reordered*
+//     vs the DDL declaration -> SELECT toString(v) -> assert canonical names.
+//     This proves the writer resolves by dictionary string, not by assuming
+//     the Arrow key equals the CH enum index.
+// ===========================================================================
+
+/// # Panics
+/// Asserts Enum8 round-trips through the Arrow dictionary path in both
+/// directions, including a reordered write-side dictionary.
+pub async fn test_enum_dictionary(ch: Arc<ClickHouseContainer>) {
+    use arrow::datatypes::Int8Type;
+
+    let client = connect(ch.as_ref()).await;
+    // DDL declares the enum with explicit, non-zero-based indices.
+    let col = "Enum8('red' = 1, 'green' = 2, 'blue' = 3)";
+
+    // --- Direction A: SQL insert -> Arrow read, assert key space ----------
+    header(Qid::new(), "Enum: SQL insert -> Arrow dictionary read");
+    {
+        let (db, table) = create_typed_table(&client, col).await;
+        let fq = format!("{db}.{table}");
+        // Rows: red, blue, green, blue. Positions in the declaration are
+        // red=0, green=1, blue=2 -> expected Arrow keys [0, 2, 1, 2].
+        let rows: Vec<(u32, String)> = vec![
+            (0, "'red'".into()),
+            (1, "'blue'".into()),
+            (2, "'green'".into()),
+            (3, "'blue'".into()),
+        ];
+        sql_insert(&client, &fq, &rows).await;
+
+        let column = read_v_column(&client, &fq).await;
+        let dict = column
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("Enum8 should deserialize to DictionaryArray<Int8Type>");
+
+        assert_eq!(
+            dict.keys(),
+            &Int8Array::from(vec![0, 2, 1, 2]),
+            "[enum A] keys must be positions in the enum declaration"
+        );
+        let values = dict.values().as_any().downcast_ref::<StringArray>().expect("string values");
+        // Resolve each row to its name to confirm the values table + keys agree.
+        let names: Vec<&str> = (0..dict.len())
+            .map(|i| values.value(usize::try_from(dict.keys().value(i)).unwrap()))
+            .collect();
+        assert_eq!(names, vec!["red", "blue", "green", "blue"], "[enum A] resolved names");
+
+        drop_typed_table(&client, &db, &table).await;
+    }
+
+    // --- Direction B: reordered Arrow dictionary -> SQL toString ----------
+    header(Qid::new(), "Enum: reordered Arrow dictionary -> SQL toString");
+    {
+        // Dictionary value table deliberately NOT in declaration order, and a
+        // subset is fine too. Rows: blue, red, green, red.
+        let dict_values = StringArray::from(vec!["blue", "red", "green"]);
+        let keys = Int8Array::from(vec![0, 1, 2, 1]); // blue, red, green, red
+        let array =
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(dict_values)).unwrap())
+                as ArrayRef;
+
+        direction_b(
+            &client,
+            col,
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            vec![0, 1, 2, 3],
+            array,
+            &["blue", "red", "green", "red"],
+        )
+        .await;
+    }
+
+    // --- Enum16: exercise the i16 wire path in both directions ------------
+    //
+    // Enum16 differs from Enum8 only in width + little-endian byte order. A
+    // byte-order bug would round-trip-cancel in a pure-Arrow test, so it has
+    // to be exercised against the server. Use non-contiguous indices so a
+    // key==index confusion would show up.
+    let col16 = "Enum16('lo' = 100, 'mid' = 1000, 'hi' = 30000)";
+
+    header(Qid::new(), "Enum16: SQL insert -> Arrow dictionary read");
+    {
+        let (db, table) = create_typed_table(&client, col16).await;
+        let fq = format!("{db}.{table}");
+        // Rows: hi, lo, mid, hi. Declaration positions: lo=0, mid=1, hi=2
+        // -> expected keys [2, 0, 1, 2].
+        let rows: Vec<(u32, String)> =
+            vec![(0, "'hi'".into()), (1, "'lo'".into()), (2, "'mid'".into()), (3, "'hi'".into())];
+        sql_insert(&client, &fq, &rows).await;
+
+        let column = read_v_column(&client, &fq).await;
+        let dict = column
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int16Type>>()
+            .expect("Enum16 should deserialize to DictionaryArray<Int16Type>");
+        assert_eq!(
+            dict.keys(),
+            &Int16Array::from(vec![2, 0, 1, 2]),
+            "[enum16 A] keys must be positions in the enum declaration"
+        );
+
+        drop_typed_table(&client, &db, &table).await;
+    }
+
+    header(Qid::new(), "Enum16: reordered Arrow dictionary -> SQL toString");
+    {
+        let dict_values = StringArray::from(vec!["hi", "lo", "mid"]); // reordered
+        let keys = Int16Array::from(vec![1, 0, 2, 0]); // lo, hi, mid, hi
+        let array =
+            Arc::new(DictionaryArray::<Int16Type>::try_new(keys, Arc::new(dict_values)).unwrap())
+                as ArrayRef;
+
+        direction_b(
+            &client,
+            col16,
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            vec![0, 1, 2, 3],
+            array,
+            &["lo", "hi", "mid", "hi"],
+        )
+        .await;
+    }
+
+    client.shutdown().await.expect("shutdown");
+}
