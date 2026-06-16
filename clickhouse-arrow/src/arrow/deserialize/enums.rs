@@ -393,6 +393,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_deserialize_enum16_too_many_variants_errors() {
+        // Same ceiling for Enum16: the Arrow key is Int16, positive range caps
+        // positions at 32767. A 32769-variant enum makes position 32768
+        // unrepresentable -> a clean error. CH itself permits up to 65536
+        // Enum16 variants, so this is a real (if extreme) schema. The error
+        // keys off `position` (a clean usize), so the wrapped/duplicate `ch`
+        // indices past i16::MAX don't matter.
+        let pairs: Vec<(String, i16)> = (0..32769)
+            .map(|i| {
+                #[expect(clippy::cast_possible_truncation)]
+                let ch = i as i16;
+                (format!("v{i}"), ch)
+            })
+            .collect();
+        // Two bytes: one i16 row index (the error fires before it's used).
+        let data = vec![0_u8, 0_u8];
+        let mut reader = MockReader::new(data);
+
+        let type_ = Type::Enum16(pairs);
+        let data_type = arrow::datatypes::DataType::Dictionary(
+            Box::new(arrow::datatypes::DataType::Int16),
+            Box::new(arrow::datatypes::DataType::Utf8),
+        );
+        let mut builder = TypedBuilder::try_new(&type_, &data_type).unwrap();
+        let result = deserialize_async(&type_, &mut builder, &mut reader, 1, &[]).await;
+        assert!(matches!(
+            result,
+            Err(Error::ArrowDeserialize(msg)) if msg.contains("too many variants")
+        ));
+    }
+
+    #[tokio::test]
     async fn test_deserialize_enum8_key_space_is_schema_defined() {
         // Fidelity property: even when only the *last* declared value appears,
         // its key is its position in pairs (2), not 0. A first-seen-interning

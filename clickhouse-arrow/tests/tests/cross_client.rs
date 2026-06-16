@@ -818,8 +818,9 @@ pub async fn test_sparse_default_fill_non_nullable(ch: Arc<ClickHouseContainer>)
 // ===========================================================================
 
 /// # Panics
-/// Asserts Enum8 round-trips through the Arrow dictionary path in both
-/// directions, including a reordered write-side dictionary.
+/// Asserts Enum8 and Enum16 round-trip through the Arrow dictionary path in
+/// both directions, including a reordered write-side dictionary.
+#[expect(clippy::too_many_lines)] // two enum widths x two directions, scope is the value
 pub async fn test_enum_dictionary(ch: Arc<ClickHouseContainer>) {
     use arrow::datatypes::Int8Type;
 
@@ -856,7 +857,11 @@ pub async fn test_enum_dictionary(ch: Arc<ClickHouseContainer>) {
         let values = dict.values().as_any().downcast_ref::<StringArray>().expect("string values");
         // Resolve each row to its name to confirm the values table + keys agree.
         let names: Vec<&str> = (0..dict.len())
-            .map(|i| values.value(usize::try_from(dict.keys().value(i)).unwrap()))
+            .map(|i| {
+                let k = usize::try_from(dict.keys().value(i))
+                    .expect("enum8 key must be a non-negative position index");
+                values.value(k)
+            })
             .collect();
         assert_eq!(names, vec!["red", "blue", "green", "blue"], "[enum A] resolved names");
 
@@ -913,6 +918,17 @@ pub async fn test_enum_dictionary(ch: Arc<ClickHouseContainer>) {
             &Int16Array::from(vec![2, 0, 1, 2]),
             "[enum16 A] keys must be positions in the enum declaration"
         );
+        // Resolve each row to its name so a transposed values array (right
+        // keys, wrong value table) is also caught on the read path.
+        let values = dict.values().as_any().downcast_ref::<StringArray>().expect("string values");
+        let names: Vec<&str> = (0..dict.len())
+            .map(|i| {
+                let k = usize::try_from(dict.keys().value(i))
+                    .expect("enum16 key must be a non-negative position index");
+                values.value(k)
+            })
+            .collect();
+        assert_eq!(names, vec!["hi", "lo", "mid", "hi"], "[enum16 A] resolved names");
 
         drop_typed_table(&client, &db, &table).await;
     }
